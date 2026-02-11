@@ -331,6 +331,45 @@ def fetch_chain_transactions(address: str, currency: str) -> list[dict]:
     return []
 
 
+def _address_explorer_url(address: str, currency: str) -> str | None:
+    if currency == "BTC":
+        return f"https://www.blockchain.com/explorer/addresses/btc/{address}"
+    if currency == "LTC":
+        return f"https://blockchair.com/litecoin/address/{address}"
+    if currency == "USDT (TRC20)":
+        return f"https://tronscan.org/#/address/{address}"
+    if currency == "BNB (BEP20)":
+        return f"https://bscscan.com/address/{address}"
+    return None
+
+
+def get_recent_addresses_with_links(user_id: int, limit: int = 4) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
+    res = (
+        supabase.table("addresses")
+        .select("address,currency,created_at")
+        .eq("user_id", user_id)
+        .gte("created_at", cutoff)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    entries = []
+    seen = set()
+    for row in res.data or []:
+        address = row.get("address")
+        currency = row.get("currency")
+        if not address or address in seen:
+            continue
+        seen.add(address)
+        link = _address_explorer_url(address, currency)
+        if not link:
+            continue
+        entries.append({"currency": currency, "address": address, "link": link})
+    return entries
+
+
 async def get_incoming_transactions(user_id: int) -> list:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
     addresses = supabase.table("addresses").select("*").eq("user_id", user_id).gte("created_at", cutoff).execute()
@@ -358,7 +397,7 @@ async def get_incoming_transactions(user_id: int) -> list:
     return incoming
 
 
-def _build_check_response(uid: int, deposits: list, incoming: list) -> str:
+def _build_check_response(uid: int, deposits: list, incoming: list, scan_links: list[dict] | None = None) -> str:
     parts = []
     if deposits:
         total = sum(d["amount_usd"] for d in deposits)
@@ -374,6 +413,10 @@ def _build_check_response(uid: int, deposits: list, incoming: list) -> str:
         ]
         more = "" if len(incoming) <= 3 else f"\n...and {len(incoming) - 3} more incoming tx"
         parts.append("⏳ Incoming transactions:\n" + "\n".join(lines) + more)
+
+    if scan_links:
+        link_lines = [f"• {entry['currency']}: {entry['link']}" for entry in scan_links]
+        parts.append("🔎 Scanner links (recent addresses):\n" + "\n".join(link_lines))
 
     parts.append(f"💳 Balance: ${get_balance(uid):.2f}")
     return "\n\n".join(parts)
@@ -535,8 +578,9 @@ async def check_my_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Checking blockchain...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
     incoming = await get_incoming_transactions(uid)
+    scan_links = get_recent_addresses_with_links(uid)
     await update.message.reply_text(
-        _build_check_response(uid, deposits, incoming),
+        _build_check_response(uid, deposits, incoming, scan_links),
         reply_markup=kb_after_deposit(),
     )
 
@@ -548,9 +592,10 @@ async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text("🔄 Checking blockchain for all your recent addresses...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
     incoming = await get_incoming_transactions(uid)
+    scan_links = get_recent_addresses_with_links(uid)
     await context.bot.send_message(
         chat_id=uid,
-        text=_build_check_response(uid, deposits, incoming),
+        text=_build_check_response(uid, deposits, incoming, scan_links),
         reply_markup=kb_after_deposit(),
     )
 
