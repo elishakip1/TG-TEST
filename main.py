@@ -3,11 +3,10 @@ import uuid
 import yaml
 import logging
 import requests
-import asyncio
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 logger = logging.getLogger("ULTIMATESHOP")
 logger.setLevel(logging.INFO)
@@ -30,6 +29,7 @@ ADMIN_ID = int(config.get("telegram", {}).get("admin_id", 2124577519))
 DV_BASE_URL = config["server"]["dv_base_url"].rstrip("/")
 DV_API_KEY = config["server"]["dv_api_key"]
 SCAN_MINUTES = int(config.get("scanner", {}).get("interval_minutes", 5))
+ADDRESS_SCAN_HOURS = int(config.get("scanner", {}).get("address_lookback_hours", 36))
 
 supabase_url = config["supabase"]["url"]
 supabase_key = config["supabase"]["key"]
@@ -84,6 +84,10 @@ def kb_after_deposit() -> ReplyKeyboardMarkup:
         [[KeyboardButton("🔄 Check Deposit")], [KeyboardButton("➕ New Deposit"), KeyboardButton("🏠 Home")]],
         resize_keyboard=True,
     )
+
+
+def kb_balance_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check Deposit", callback_data="check_deposit_now")]])
 
 
 def extract_address_from_response(text: str, currency: str) -> str | None:
@@ -219,15 +223,20 @@ def _fetch_btc_txs(address: str) -> list[dict]:
 
 
 def _fetch_ltc_txs(address: str) -> list[dict]:
-    url = f"https://api.blockchair.com/litecoin/dashboards/address/{address}?limit=50"
+    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/full?limit=50"
     r = requests.get(url, timeout=15)
     if r.status_code != 200:
         return []
-    data = r.json().get("data", {}).get(address, {})
-    txids = data.get("transactions", [])
+    data = r.json()
     txs = []
-    for txid in txids[:20]:
-        txs.append({"hash": txid, "amount": 0.0, "confirmed": True})
+    for tx in data.get("txs", []):
+        tx_hash = tx.get("hash")
+        value_litoshi = 0
+        for out in tx.get("outputs", []):
+            if address in out.get("addresses", []):
+                value_litoshi += int(out.get("value", 0))
+        if tx_hash and value_litoshi > 0 and tx.get("confirmations", 0) > 0:
+            txs.append({"hash": tx_hash, "amount": value_litoshi / 100_000_000, "confirmed": True})
     return txs
 
 
@@ -255,15 +264,23 @@ def _fetch_trc20_txs(address: str) -> list[dict]:
 
 
 def _fetch_bnb_txs(address: str) -> list[dict]:
-    url = f"https://api.blockchair.com/binance-smart-chain/dashboards/address/{address}?limit=50"
+    url = f"https://blockscout.com/bsc/mainnet/api?module=account&action=txlist&address={address}&sort=desc"
     r = requests.get(url, timeout=15)
     if r.status_code != 200:
         return []
-    data = r.json().get("data", {}).get(address, {})
-    txids = data.get("transactions", [])
+    payload = r.json()
+    if str(payload.get("status")) != "1":
+        return []
     txs = []
-    for txid in txids[:20]:
-        txs.append({"hash": txid, "amount": 0.0, "confirmed": True})
+    for tx in payload.get("result", [])[:100]:
+        tx_hash = tx.get("hash")
+        to_addr = str(tx.get("to", "")).lower()
+        if to_addr != address.lower():
+            continue
+        confirmations = int(tx.get("confirmations", 0) or 0)
+        amount_wei = int(tx.get("value", 0) or 0)
+        if tx_hash and amount_wei > 0 and confirmations > 0:
+            txs.append({"hash": tx_hash, "amount": amount_wei / 1_000_000_000_000_000_000, "confirmed": True})
     return txs
 
 
@@ -279,9 +296,28 @@ def fetch_chain_transactions(address: str, currency: str) -> list[dict]:
     return []
 
 
+async def _notify_admin_deposit(bot, deposit_event: dict):
+    if not bot:
+        return
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "💰 New Deposit\n"
+                f"User: {deposit_event['user_id']}\n"
+                f"Amount: {deposit_event['crypto']}\n"
+                f"USD: ${deposit_event['amount_usd']:.2f}\n"
+                f"Tx: {deposit_event['tx_hash']}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("Admin notification failed: %s", exc)
+
+
 async def check_deposits(user_id: int = None, bot=None) -> list:
     try:
-        query = supabase.table("addresses").select("*").gte("expires_at", datetime.now(timezone.utc).isoformat())
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
+        query = supabase.table("addresses").select("*").gte("created_at", cutoff)
         if user_id:
             query = query.eq("user_id", user_id)
         addresses = query.execute()
@@ -318,14 +354,13 @@ async def check_deposits(user_id: int = None, bot=None) -> list:
                     }
                     supabase.table("deposits").insert(deposit).execute()
                     update_balance(addr["user_id"], usd_amount, "add")
-                    new_deposits.append(
-                        {
-                            "user_id": addr["user_id"],
-                            "amount_usd": usd_amount,
-                            "crypto": f"{crypto_amount:.4f} {addr['currency']}",
-                            "tx_hash": tx_hash[:16],
-                        }
-                    )
+                    event = {
+                        "user_id": addr["user_id"],
+                        "amount_usd": usd_amount,
+                        "crypto": f"{crypto_amount:.4f} {addr['currency']}",
+                        "tx_hash": tx_hash[:16],
+                    }
+                    new_deposits.append(event)
                     if bot:
                         try:
                             await bot.send_message(
@@ -334,6 +369,7 @@ async def check_deposits(user_id: int = None, bot=None) -> list:
                             )
                         except Exception:
                             pass
+                        await _notify_admin_deposit(bot, event)
             except Exception as e:
                 logger.error("TX check failed for %s: %s", addr.get("address"), e)
         return new_deposits
@@ -342,16 +378,14 @@ async def check_deposits(user_id: int = None, bot=None) -> list:
         return []
 
 
-async def deposit_worker(app):
-    while True:
-        await asyncio.sleep(max(60, SCAN_MINUTES * 60))
-        try:
-            deposits = await check_deposits(user_id=None, bot=app.bot)
-            if deposits:
-                total = sum(d["amount_usd"] for d in deposits)
-                logger.info("Auto-deposits: %s total $%.2f", len(deposits), total)
-        except Exception as e:
-            logger.error("Worker error: %s", e)
+async def deposit_worker(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        deposits = await check_deposits(user_id=None, bot=context.application.bot)
+        if deposits:
+            total = sum(d["amount_usd"] for d in deposits)
+            logger.info("Auto-deposits: %s total $%.2f", len(deposits), total)
+    except Exception as e:
+        logger.error("Worker error: %s", e)
 
 
 def is_admin(uid: int) -> bool:
@@ -402,9 +436,34 @@ async def check_my_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ No new deposits\n💳 Balance: ${get_balance(uid):.2f}", reply_markup=kb_after_deposit())
 
 
+async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    await query.edit_message_text("🔄 Checking blockchain for all your recent addresses...")
+    deposits = await check_deposits(user_id=uid, bot=context.application.bot)
+    if deposits:
+        total = sum(d["amount_usd"] for d in deposits)
+        await context.bot.send_message(
+            chat_id=uid,
+            text=f"✅ Found {len(deposits)} new deposit(s)!\n💰 +${total:.2f}\n💳 Balance: ${get_balance(uid):.2f}",
+            reply_markup=kb_after_deposit(),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=uid,
+            text=f"✅ No new deposits\n💳 Balance: ${get_balance(uid):.2f}",
+            reply_markup=kb_after_deposit(),
+        )
+
+
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(f"🆔 {uid}\n💰 ${get_balance(uid):.2f} USD", reply_markup=kb_home(is_admin(uid)))
+    await update.message.reply_text(
+        f"🆔 {uid}\n💰 ${get_balance(uid):.2f} USD",
+        reply_markup=kb_home(is_admin(uid)),
+    )
+    await update.message.reply_text("Quick actions:", reply_markup=kb_balance_actions())
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,10 +507,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(check_my_deposit_callback, pattern="^check_deposit_now$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(deposit_worker(app))
+    app.job_queue.run_repeating(deposit_worker, interval=max(60, SCAN_MINUTES * 60), first=30)
     logger.info("ULTIMATESHOP FINAL - Starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
