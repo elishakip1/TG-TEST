@@ -31,6 +31,7 @@ DV_BASE_URL = config["server"]["dv_base_url"].rstrip("/")
 DV_API_KEY = config["server"]["dv_api_key"]
 SCAN_MINUTES = int(config.get("scanner", {}).get("interval_minutes", 5))
 ADDRESS_SCAN_HOURS = int(config.get("scanner", {}).get("address_lookback_hours", 36))
+MIN_CONFIRMATIONS = int(config.get("scanner", {}).get("min_confirmations", 2))
 
 supabase_url = config["supabase"]["url"]
 supabase_key = config["supabase"]["key"]
@@ -248,8 +249,9 @@ def _fetch_btc_txs(address: str) -> list[dict]:
         for out in tx.get("outputs", []):
             if address in out.get("addresses", []):
                 value_sats += int(out.get("value", 0))
-        if tx_hash and value_sats > 0 and tx.get("confirmations", 0) > 0:
-            txs.append({"hash": tx_hash, "amount": value_sats / 100_000_000, "confirmed": True})
+        if tx_hash and value_sats > 0:
+            confirmations = int(tx.get("confirmations", 0) or 0)
+            txs.append({"hash": tx_hash, "amount": value_sats / 100_000_000, "confirmations": confirmations})
     return txs
 
 
@@ -266,8 +268,9 @@ def _fetch_ltc_txs(address: str) -> list[dict]:
         for out in tx.get("outputs", []):
             if address in out.get("addresses", []):
                 value_litoshi += int(out.get("value", 0))
-        if tx_hash and value_litoshi > 0 and tx.get("confirmations", 0) > 0:
-            txs.append({"hash": tx_hash, "amount": value_litoshi / 100_000_000, "confirmed": True})
+        if tx_hash and value_litoshi > 0:
+            confirmations = int(tx.get("confirmations", 0) or 0)
+            txs.append({"hash": tx_hash, "amount": value_litoshi / 100_000_000, "confirmations": confirmations})
     return txs
 
 
@@ -290,7 +293,8 @@ def _fetch_trc20_txs(address: str) -> list[dict]:
         amount = quant / (10**dec)
         tx_hash = tx.get("transaction_id")
         if tx_hash and amount > 0:
-            txs.append({"hash": tx_hash, "amount": amount, "confirmed": True})
+            confirmations = 2 if tx.get("confirmed") else 0
+            txs.append({"hash": tx_hash, "amount": amount, "confirmations": confirmations})
     return txs
 
 
@@ -310,8 +314,8 @@ def _fetch_bnb_txs(address: str) -> list[dict]:
             continue
         confirmations = int(tx.get("confirmations", 0) or 0)
         amount_wei = int(tx.get("value", 0) or 0)
-        if tx_hash and amount_wei > 0 and confirmations > 0:
-            txs.append({"hash": tx_hash, "amount": amount_wei / 1_000_000_000_000_000_000, "confirmed": True})
+        if tx_hash and amount_wei > 0:
+            txs.append({"hash": tx_hash, "amount": amount_wei / 1_000_000_000_000_000_000, "confirmations": confirmations})
     return txs
 
 
@@ -325,6 +329,54 @@ def fetch_chain_transactions(address: str, currency: str) -> list[dict]:
     if currency == "BNB (BEP20)":
         return _fetch_bnb_txs(address)
     return []
+
+
+async def get_incoming_transactions(user_id: int) -> list:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
+    addresses = supabase.table("addresses").select("*").eq("user_id", user_id).gte("created_at", cutoff).execute()
+    incoming = []
+    for addr in addresses.data or []:
+        try:
+            txs = fetch_chain_transactions(addr["address"], addr["currency"])
+            for tx in txs:
+                tx_hash = tx.get("hash")
+                confirmations = int(tx.get("confirmations", 0) or 0)
+                amount = float(tx.get("amount", 0) or 0)
+                if not tx_hash or amount <= 0 or confirmations >= MIN_CONFIRMATIONS:
+                    continue
+                existing = supabase.table("deposits").select("id").eq("tx_hash", tx_hash).execute()
+                if existing.data:
+                    continue
+                incoming.append({
+                    "currency": addr["currency"],
+                    "amount": amount,
+                    "confirmations": confirmations,
+                    "tx_hash": tx_hash[:16],
+                })
+        except Exception as exc:
+            logger.error("Incoming TX check failed for %s: %s", addr.get("address"), exc)
+    return incoming
+
+
+def _build_check_response(uid: int, deposits: list, incoming: list) -> str:
+    parts = []
+    if deposits:
+        total = sum(d["amount_usd"] for d in deposits)
+        parts.append(f"✅ Found {len(deposits)} new deposit(s)!\n💰 +${total:.2f}")
+    else:
+        parts.append("✅ No new confirmed deposits")
+
+    if incoming:
+        preview = incoming[:3]
+        lines = [
+            f"• {tx['amount']:.6f} {tx['currency']} ({tx['confirmations']}/{MIN_CONFIRMATIONS}) #{tx['tx_hash']}"
+            for tx in preview
+        ]
+        more = "" if len(incoming) <= 3 else f"\n...and {len(incoming) - 3} more incoming tx"
+        parts.append("⏳ Incoming transactions:\n" + "\n".join(lines) + more)
+
+    parts.append(f"💳 Balance: ${get_balance(uid):.2f}")
+    return "\n\n".join(parts)
 
 
 async def _notify_admin_deposit(bot, deposit_event: dict):
@@ -367,7 +419,8 @@ async def check_deposits(user_id: int = None, bot=None) -> list:
                         continue
 
                     crypto_amount = float(tx.get("amount", 0.0))
-                    if crypto_amount <= 0:
+                    confirmations = int(tx.get("confirmations", 0) or 0)
+                    if crypto_amount <= 0 or confirmations < MIN_CONFIRMATIONS:
                         continue
                     dv_currency = CURRENCY_MAP.get(addr["currency"], addr["currency"])
                     rate = rates.get(dv_currency, FALLBACK_EXCHANGE_RATES.get(dv_currency, 1.0))
@@ -481,14 +534,11 @@ async def check_my_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text("🔄 Checking blockchain...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
-    if deposits:
-        total = sum(d["amount_usd"] for d in deposits)
-        await update.message.reply_text(
-            f"✅ Found {len(deposits)} new deposit(s)!\n💰 +${total:.2f}\n💳 Balance: ${get_balance(uid):.2f}",
-            reply_markup=kb_after_deposit(),
-        )
-    else:
-        await update.message.reply_text(f"✅ No new deposits\n💳 Balance: ${get_balance(uid):.2f}", reply_markup=kb_after_deposit())
+    incoming = await get_incoming_transactions(uid)
+    await update.message.reply_text(
+        _build_check_response(uid, deposits, incoming),
+        reply_markup=kb_after_deposit(),
+    )
 
 
 async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,19 +547,12 @@ async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAUL
     uid = query.from_user.id
     await query.edit_message_text("🔄 Checking blockchain for all your recent addresses...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
-    if deposits:
-        total = sum(d["amount_usd"] for d in deposits)
-        await context.bot.send_message(
-            chat_id=uid,
-            text=f"✅ Found {len(deposits)} new deposit(s)!\n💰 +${total:.2f}\n💳 Balance: ${get_balance(uid):.2f}",
-            reply_markup=kb_after_deposit(),
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=uid,
-            text=f"✅ No new deposits\n💳 Balance: ${get_balance(uid):.2f}",
-            reply_markup=kb_after_deposit(),
-        )
+    incoming = await get_incoming_transactions(uid)
+    await context.bot.send_message(
+        chat_id=uid,
+        text=_build_check_response(uid, deposits, incoming),
+        reply_markup=kb_after_deposit(),
+    )
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
