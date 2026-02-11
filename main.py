@@ -29,6 +29,7 @@ BOT_TOKEN = config["telegram"]["token"]
 ADMIN_ID = int(config.get("telegram", {}).get("admin_id", 2124577519))
 DV_BASE_URL = config["server"]["dv_base_url"].rstrip("/")
 DV_API_KEY = config["server"]["dv_api_key"]
+TATUM_API_KEY = config.get("server", {}).get("tatum_api_key", "")
 SCAN_MINUTES = int(config.get("scanner", {}).get("interval_minutes", 5))
 ADDRESS_SCAN_HOURS = int(config.get("scanner", {}).get("address_lookback_hours", 36))
 MIN_CONFIRMATIONS = int(config.get("scanner", {}).get("min_confirmations", 2))
@@ -236,87 +237,143 @@ def get_or_create_address(user_id: int, currency: str) -> dict | None:
         return None
 
 
+def _tatum_get(path: str, params: dict | None = None):
+    if not TATUM_API_KEY:
+        logger.warning("Tatum API key missing. Set server.tatum_api_key in config.yaml")
+        return None
+    try:
+        resp = requests.get(
+            f"https://api.tatum.io{path}",
+            params=params or {},
+            headers={"x-api-key": TATUM_API_KEY},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.warning("Tatum request failed %s %s status=%s", path, params or {}, resp.status_code)
+            return None
+        return resp.json()
+    except Exception as exc:
+        logger.warning("Tatum request error %s: %s", path, exc)
+        return None
+
+
+def _extract_tatum_incoming(rows: list, address: str, decimals: int, force_min_conf: int = 0) -> list[dict]:
+    out = []
+    target = str(address).lower()
+    for row in rows or []:
+        to_addr = str(row.get("to") or row.get("toAddress") or row.get("counterAddress") or "").lower()
+        if to_addr and to_addr != target:
+            continue
+
+        tx_hash = row.get("hash") or row.get("txId") or row.get("transactionHash")
+        amount_raw = row.get("amount") or row.get("value") or row.get("total") or 0
+        try:
+            amount = float(amount_raw)
+        except Exception:
+            try:
+                amount = int(str(amount_raw)) / (10 ** decimals)
+            except Exception:
+                amount = 0.0
+
+        confirmations = row.get("confirmations")
+        if confirmations is None:
+            confirmations = force_min_conf if row.get("blockNumber") or row.get("block") else 0
+        try:
+            confirmations = int(confirmations or 0)
+        except Exception:
+            confirmations = 0
+
+        if tx_hash and amount > 0:
+            out.append({"hash": tx_hash, "amount": amount, "confirmations": confirmations})
+    return out
+
+
 def _fetch_btc_txs(address: str) -> list[dict]:
-    url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/full?limit=50"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return []
-    data = r.json()
-    txs = []
-    for tx in data.get("txs", []):
-        tx_hash = tx.get("hash")
-        value_sats = 0
-        for out in tx.get("outputs", []):
-            if address in out.get("addresses", []):
-                value_sats += int(out.get("value", 0))
-        if tx_hash and value_sats > 0:
-            confirmations = int(tx.get("confirmations", 0) or 0)
-            txs.append({"hash": tx_hash, "amount": value_sats / 100_000_000, "confirmations": confirmations})
-    return txs
+    data = _tatum_get(f"/v3/bitcoin/transaction/address/{address}", params={"pageSize": 50, "offset": 0})
+    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
+    return _extract_tatum_incoming(rows, address, decimals=8)
 
 
 def _fetch_ltc_txs(address: str) -> list[dict]:
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/full?limit=50"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return []
-    data = r.json()
-    txs = []
-    for tx in data.get("txs", []):
-        tx_hash = tx.get("hash")
-        value_litoshi = 0
-        for out in tx.get("outputs", []):
-            if address in out.get("addresses", []):
-                value_litoshi += int(out.get("value", 0))
-        if tx_hash and value_litoshi > 0:
-            confirmations = int(tx.get("confirmations", 0) or 0)
-            txs.append({"hash": tx_hash, "amount": value_litoshi / 100_000_000, "confirmations": confirmations})
-    return txs
+    data = _tatum_get(f"/v3/litecoin/transaction/address/{address}", params={"pageSize": 50, "offset": 0})
+    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
+    return _extract_tatum_incoming(rows, address, decimals=8)
+
+
+def _fetch_bnb_txs(address: str) -> list[dict]:
+    data = _tatum_get(f"/v3/bsc/transaction/address/{address}", params={"pageSize": 100, "offset": 0})
+    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
+    return _extract_tatum_incoming(rows, address, decimals=18)
 
 
 def _fetch_trc20_txs(address: str) -> list[dict]:
-    url = (
-        "https://apilist.tronscanapi.com/api/token_trc20/transfers"
-        f"?limit=20&start=0&sort=-timestamp&count=true&relatedAddress={address}"
-    )
-    r = requests.get(url, timeout=20)
-    if r.status_code != 200:
-        return []
+    # TRC20 token transfers for an address; we only keep USDT transfers to this address.
+    data = _tatum_get(f"/v3/tron/transaction/account/{address}", params={"pageSize": 100, "offset": 0})
+    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
     txs = []
-    for tx in r.json().get("token_transfers", []):
-        if tx.get("to_address") != address:
+    for row in rows or []:
+        to_addr = str(row.get("to") or row.get("toAddress") or "").lower()
+        symbol = str(row.get("tokenSymbol") or row.get("symbol") or row.get("asset") or "").upper()
+        if to_addr != address.lower():
             continue
-        if str(tx.get("tokenAbbr", "")).upper() != "USDT":
+        if symbol and symbol != "USDT":
             continue
-        quant = float(tx.get("quant", 0))
-        dec = int(tx.get("tokenDecimal", 6) or 6)
-        amount = quant / (10**dec)
-        tx_hash = tx.get("transaction_id")
+        tx_hash = row.get("hash") or row.get("txId") or row.get("transactionHash")
+        amount_raw = row.get("amount") or row.get("value") or 0
+        try:
+            amount = float(amount_raw)
+        except Exception:
+            try:
+                amount = int(str(amount_raw)) / (10 ** int(row.get("tokenDecimal", 6) or 6))
+            except Exception:
+                amount = 0.0
+
+        confirmations = row.get("confirmations")
+        if confirmations is None:
+            confirmations = MIN_CONFIRMATIONS if row.get("blockNumber") else 0
+        try:
+            confirmations = int(confirmations or 0)
+        except Exception:
+            confirmations = 0
+
         if tx_hash and amount > 0:
-            confirmations = 2 if tx.get("confirmed") else 0
             txs.append({"hash": tx_hash, "amount": amount, "confirmations": confirmations})
     return txs
 
 
-def _fetch_bnb_txs(address: str) -> list[dict]:
-    url = f"https://blockscout.com/bsc/mainnet/api?module=account&action=txlist&address={address}&sort=desc"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return []
-    payload = r.json()
-    if str(payload.get("status")) != "1":
-        return []
-    txs = []
-    for tx in payload.get("result", [])[:100]:
-        tx_hash = tx.get("hash")
-        to_addr = str(tx.get("to", "")).lower()
-        if to_addr != address.lower():
-            continue
-        confirmations = int(tx.get("confirmations", 0) or 0)
-        amount_wei = int(tx.get("value", 0) or 0)
-        if tx_hash and amount_wei > 0:
-            txs.append({"hash": tx_hash, "amount": amount_wei / 1_000_000_000_000_000_000, "confirmations": confirmations})
-    return txs
+def get_tatum_wallet_balance(address: str, currency: str) -> float:
+    endpoints = {
+        "BTC": (f"/v3/bitcoin/address/balance/{address}", 8),
+        "LTC": (f"/v3/litecoin/address/balance/{address}", 8),
+        "BNB (BEP20)": (f"/v3/bsc/account/balance/{address}", 18),
+        "USDT (TRC20)": (f"/v3/tron/account/{address}", 6),
+    }
+    endpoint = endpoints.get(currency)
+    if not endpoint:
+        return 0.0
+    path, decimals = endpoint
+    payload = _tatum_get(path)
+    if not isinstance(payload, dict):
+        return 0.0
+
+    if currency == "USDT (TRC20)":
+        for token in payload.get("trc20", []) or []:
+            symbol = str(token.get("symbol") or token.get("tokenSymbol") or "").upper()
+            if symbol == "USDT":
+                try:
+                    return float(token.get("balance", 0)) / (10 ** int(token.get("decimals", 6) or 6))
+                except Exception:
+                    return 0.0
+        return 0.0
+
+    value = payload.get("balance") or payload.get("incoming") or payload.get("value") or 0
+    try:
+        return float(value)
+    except Exception:
+        try:
+            return int(str(value)) / (10 ** decimals)
+        except Exception:
+            return 0.0
 
 
 def fetch_chain_transactions(address: str, currency: str) -> list[dict]:
@@ -366,7 +423,8 @@ def get_recent_addresses_with_links(user_id: int, limit: int = 4) -> list[dict]:
         link = _address_explorer_url(address, currency)
         if not link:
             continue
-        entries.append({"currency": currency, "address": address, "link": link})
+        chain_balance = get_tatum_wallet_balance(address, currency)
+        entries.append({"currency": currency, "address": address, "link": link, "chain_balance": chain_balance})
     return entries
 
 
@@ -482,7 +540,10 @@ def _build_check_response(
         parts.append("🧾 Seen transactions:\n" + "\n".join(lines) + more)
 
     if scan_links:
-        link_lines = [f"• {entry['currency']}: {entry['link']}" for entry in scan_links]
+        link_lines = [
+            f"• {entry['currency']}: {entry['link']} | chain balance: {float(entry.get('chain_balance', 0)):.8f}"
+            for entry in scan_links
+        ]
         parts.append("🔎 Scanner links (recent addresses):\n" + "\n".join(link_lines))
 
     if history:
