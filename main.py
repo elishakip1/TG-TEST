@@ -430,7 +430,30 @@ async def get_seen_transactions(user_id: int, limit: int = 8) -> list[dict]:
     return ordered[:limit]
 
 
-def _build_check_response(uid: int, deposits: list, incoming: list, seen_txs: list[dict] | None = None, scan_links: list[dict] | None = None) -> str:
+def get_deposit_history(user_id: int, limit: int = 8) -> list[dict]:
+    try:
+        history = (
+            supabase.table("deposits")
+            .select("currency,crypto_amount,usd_amount,tx_hash,created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return history.data or []
+    except Exception as exc:
+        logger.error("Deposit history fetch failed user=%s: %s", user_id, exc)
+        return []
+
+
+def _build_check_response(
+    uid: int,
+    deposits: list,
+    incoming: list,
+    seen_txs: list[dict] | None = None,
+    scan_links: list[dict] | None = None,
+    history: list[dict] | None = None,
+) -> str:
     parts = []
     if deposits:
         total = sum(d["amount_usd"] for d in deposits)
@@ -461,6 +484,17 @@ def _build_check_response(uid: int, deposits: list, incoming: list, seen_txs: li
     if scan_links:
         link_lines = [f"• {entry['currency']}: {entry['link']}" for entry in scan_links]
         parts.append("🔎 Scanner links (recent addresses):\n" + "\n".join(link_lines))
+
+    if history:
+        hist_lines = []
+        for row in history[:5]:
+            tx_hash = str(row.get("tx_hash", ""))[:16]
+            crypto = float(row.get("crypto_amount", 0) or 0)
+            usd = float(row.get("usd_amount", 0) or 0)
+            currency = row.get("currency", "")
+            hist_lines.append(f"• +{crypto:.6f} {currency} (${usd:.2f}) #{tx_hash}")
+        more = "" if len(history) <= 5 else f"\n...and {len(history) - 5} older applied tx"
+        parts.append("📚 Transaction history (applied):\n" + "\n".join(hist_lines) + more)
 
     parts.append(f"💳 Balance: ${get_balance(uid):.2f}")
     return "\n\n".join(parts)
@@ -624,8 +658,9 @@ async def check_my_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming = await get_incoming_transactions(uid)
     seen_txs = await get_seen_transactions(uid)
     scan_links = get_recent_addresses_with_links(uid)
+    history = get_deposit_history(uid)
     await update.message.reply_text(
-        _build_check_response(uid, deposits, incoming, seen_txs, scan_links),
+        _build_check_response(uid, deposits, incoming, seen_txs, scan_links, history),
         reply_markup=kb_after_deposit(),
     )
 
@@ -639,9 +674,10 @@ async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAUL
     incoming = await get_incoming_transactions(uid)
     seen_txs = await get_seen_transactions(uid)
     scan_links = get_recent_addresses_with_links(uid)
+    history = get_deposit_history(uid)
     await context.bot.send_message(
         chat_id=uid,
-        text=_build_check_response(uid, deposits, incoming, seen_txs, scan_links),
+        text=_build_check_response(uid, deposits, incoming, seen_txs, scan_links, history),
         reply_markup=kb_after_deposit(),
     )
 
