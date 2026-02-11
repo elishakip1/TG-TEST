@@ -521,6 +521,126 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Quick actions:", reply_markup=kb_balance_actions())
 
 
+# ---------- SHOP ----------
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = "SHOP_RANGE"
+    await update.message.reply_text("Enter year range (e.g., 1960-2003):", reply_markup=kb_cancel())
+
+
+def parse_year_range(text: str) -> tuple | None:
+    m = re.fullmatch(r"\s*(\d{4})\s*-\s*(\d{4})\s*", text)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    if a <= 0 or b <= 0 or a > b or b > datetime.now().year + 1:
+        return None
+    return a, b
+
+
+async def shop_range_received(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    years = parse_year_range(text)
+    if not years:
+        await update.message.reply_text("❌ Invalid range", reply_markup=kb_cancel())
+        return
+
+    start, end = years
+    context.user_data["shop_start"] = start
+    context.user_data["shop_end"] = end
+    context.user_data["state"] = "SHOP_QTY"
+
+    res = (
+        supabase.table("books")
+        .select("id", count="exact")
+        .eq("sold", False)
+        .eq("status", "active")
+        .gte("db", f"{start}-01-01")
+        .lte("db", f"{end}-12-31")
+        .execute()
+    )
+
+    available = getattr(res, "count", 0) or 0
+    await update.message.reply_text(
+        f"✅ {start}-{end}\nAvailable: {available}\n\nEnter quantity:",
+        reply_markup=kb_cancel(),
+    )
+
+
+async def shop_qty_received(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    uid = update.effective_user.id
+    if not text.isdigit() or int(text) <= 0:
+        await update.message.reply_text("❌ Positive number only", reply_markup=kb_cancel())
+        return
+
+    qty = int(text)
+    start = context.user_data.get("shop_start")
+    end = context.user_data.get("shop_end")
+    unit_price = 10.0
+    total = qty * unit_price
+
+    balance_usd = get_balance(uid)
+    if balance_usd < total:
+        await update.message.reply_text(
+            f"❌ Insufficient balance!\nNeed: ${total:.2f}\nHave: ${balance_usd:.2f}",
+            reply_markup=kb_home(is_admin(uid)),
+        )
+        context.user_data["state"] = None
+        return
+
+    try:
+        data = supabase.rpc(
+            "purchase_books",
+            {
+                "p_user_id": uid,
+                "p_start_year": start,
+                "p_end_year": end,
+                "p_qty": qty,
+                "p_unit_price": unit_price,
+            },
+        ).execute().data
+
+        if not data:
+            await update.message.reply_text("❌ No books available", reply_markup=kb_home(is_admin(uid)))
+            context.user_data["state"] = None
+            return
+
+        update_balance(uid, total, "subtract")
+
+        lines = []
+        for row in data:
+            lines.append(",".join([
+                str(row.get("title", "")),
+                str(row.get("last_name", "")),
+                str(row.get("source_id", "")),
+                str(row.get("db", "")),
+                str(row.get("uid", "")),
+                str(row.get("email", "")),
+                str(row.get("dncode", "")),
+                str(row.get("pcode", "")),
+                str(row.get("barcode", "")),
+                str(row.get("status", "")),
+                str(row.get("worker_id", "")),
+            ]))
+
+        await context.bot.send_document(
+            chat_id=uid,
+            document="\n".join(lines).encode("utf-8"),
+            filename=f"order_{data[0]['order_id']}.txt",
+            caption=f"✅ Purchase complete!\nTotal: ${total:.2f}\nBalance: ${get_balance(uid):.2f}",
+        )
+
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🛒 New order\nUser: {uid}\nQty: {qty}\nTotal: ${total:.2f}",
+        )
+
+    except Exception as e:
+        logger.error("Purchase failed: %s", e)
+        await update.message.reply_text("❌ Purchase failed", reply_markup=kb_home(is_admin(uid)))
+
+    context.user_data["state"] = None
+    await update.message.reply_text("🏠 Home", reply_markup=kb_home(is_admin(uid)))
+
+
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = "SUPPORT_TEXT"
     await update.message.reply_text("Message for admin:", reply_markup=kb_cancel())
@@ -543,18 +663,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if state == "DEPOSIT_CURRENCY":
         await deposit_currency_received(update, context, text)
+    elif state == "SHOP_RANGE":
+        await shop_range_received(update, context, text)
+    elif state == "SHOP_QTY":
+        await shop_qty_received(update, context, text)
     elif state == "SUPPORT_TEXT":
         await support_received(update, context, text)
     elif text == "➕ Deposit":
         await deposit(update, context)
     elif text == "💰 Balance":
         await balance(update, context)
+    elif text == "🛒 Shop":
+        await shop(update, context)
     elif text == "🔄 Check Deposit":
         await check_my_deposit(update, context)
     elif text == "➕ New Deposit":
         await deposit(update, context)
     elif text == "🎧 Support":
         await support(update, context)
+    elif text == "👥 Invite":
+        await update.message.reply_text("📢 Invite friends!", reply_markup=kb_home(is_admin(uid)))
+    elif text == "ℹ️ About":
+        await update.message.reply_text("🏪 ULTIMATESHOP", reply_markup=kb_home(is_admin(uid)))
     else:
         await update.message.reply_text("❌ Unknown", reply_markup=kb_home(is_admin(uid)))
 
