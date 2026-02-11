@@ -397,7 +397,40 @@ async def get_incoming_transactions(user_id: int) -> list:
     return incoming
 
 
-def _build_check_response(uid: int, deposits: list, incoming: list, scan_links: list[dict] | None = None) -> str:
+async def get_seen_transactions(user_id: int, limit: int = 8) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
+    addresses = supabase.table("addresses").select("*").eq("user_id", user_id).gte("created_at", cutoff).execute()
+
+    seen = {}
+    for addr in addresses.data or []:
+        try:
+            txs = fetch_chain_transactions(addr["address"], addr["currency"])
+            for tx in txs:
+                tx_hash = tx.get("hash")
+                amount = float(tx.get("amount", 0) or 0)
+                confirmations = int(tx.get("confirmations", 0) or 0)
+                if not tx_hash or amount <= 0:
+                    continue
+                if tx_hash in seen:
+                    continue
+
+                existing = supabase.table("deposits").select("id,usd_amount").eq("tx_hash", tx_hash).limit(1).execute()
+                applied = bool(existing.data)
+                seen[tx_hash] = {
+                    "currency": addr["currency"],
+                    "amount": amount,
+                    "confirmations": confirmations,
+                    "tx_hash": tx_hash,
+                    "applied": applied,
+                }
+        except Exception as exc:
+            logger.error("Seen TX check failed for %s: %s", addr.get("address"), exc)
+
+    ordered = sorted(seen.values(), key=lambda row: row.get("confirmations", 0), reverse=True)
+    return ordered[:limit]
+
+
+def _build_check_response(uid: int, deposits: list, incoming: list, seen_txs: list[dict] | None = None, scan_links: list[dict] | None = None) -> str:
     parts = []
     if deposits:
         total = sum(d["amount_usd"] for d in deposits)
@@ -413,6 +446,17 @@ def _build_check_response(uid: int, deposits: list, incoming: list, scan_links: 
         ]
         more = "" if len(incoming) <= 3 else f"\n...and {len(incoming) - 3} more incoming tx"
         parts.append("⏳ Incoming transactions:\n" + "\n".join(lines) + more)
+
+    if seen_txs:
+        preview = seen_txs[:5]
+        lines = []
+        for tx in preview:
+            status = "APPLIED ✅" if tx.get("applied") else "NOT APPLIED ⏳"
+            lines.append(
+                f"• {tx['amount']:.6f} {tx['currency']} | conf {tx['confirmations']} | {status} | #{tx['tx_hash'][:16]}"
+            )
+        more = "" if len(seen_txs) <= 5 else f"\n...and {len(seen_txs) - 5} more seen tx"
+        parts.append("🧾 Seen transactions:\n" + "\n".join(lines) + more)
 
     if scan_links:
         link_lines = [f"• {entry['currency']}: {entry['link']}" for entry in scan_links]
@@ -578,9 +622,10 @@ async def check_my_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Checking blockchain...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
     incoming = await get_incoming_transactions(uid)
+    seen_txs = await get_seen_transactions(uid)
     scan_links = get_recent_addresses_with_links(uid)
     await update.message.reply_text(
-        _build_check_response(uid, deposits, incoming, scan_links),
+        _build_check_response(uid, deposits, incoming, seen_txs, scan_links),
         reply_markup=kb_after_deposit(),
     )
 
@@ -592,10 +637,11 @@ async def check_my_deposit_callback(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text("🔄 Checking blockchain for all your recent addresses...")
     deposits = await check_deposits(user_id=uid, bot=context.application.bot)
     incoming = await get_incoming_transactions(uid)
+    seen_txs = await get_seen_transactions(uid)
     scan_links = get_recent_addresses_with_links(uid)
     await context.bot.send_message(
         chat_id=uid,
-        text=_build_check_response(uid, deposits, incoming, scan_links),
+        text=_build_check_response(uid, deposits, incoming, seen_txs, scan_links),
         reply_markup=kb_after_deposit(),
     )
 
