@@ -3,6 +3,7 @@ import uuid
 import yaml
 import logging
 import requests
+import asyncio
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -42,12 +43,42 @@ CURRENCY_MAP = {
     "BNB (BEP20)": "BNB_BEP20",
 }
 
-EXCHANGE_RATES = {
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "LTC": "litecoin",
+    "USDT_TRC20": "tether",
+    "BNB_BEP20": "binancecoin",
+}
+
+FALLBACK_EXCHANGE_RATES = {
     "BTC": 45000.0,
     "LTC": 80.0,
     "USDT_TRC20": 1.0,
     "BNB_BEP20": 600.0,
 }
+
+
+def get_exchange_rates_usd() -> dict:
+    ids = ",".join(sorted(set(COINGECKO_IDS.values())))
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids, "vs_currencies": "usd"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            logger.warning("CoinGecko price fetch failed status=%s; using fallback rates", r.status_code)
+            return FALLBACK_EXCHANGE_RATES.copy()
+
+        payload = r.json()
+        rates = {}
+        for currency, cg_id in COINGECKO_IDS.items():
+            rate = float(payload.get(cg_id, {}).get("usd", 0) or 0)
+            rates[currency] = rate if rate > 0 else FALLBACK_EXCHANGE_RATES[currency]
+        return rates
+    except Exception as exc:
+        logger.warning("CoinGecko price fetch error: %s; using fallback rates", exc)
+        return FALLBACK_EXCHANGE_RATES.copy()
 
 
 def kb_home(is_admin: bool = False) -> ReplyKeyboardMarkup:
@@ -316,6 +347,7 @@ async def _notify_admin_deposit(bot, deposit_event: dict):
 
 async def check_deposits(user_id: int = None, bot=None) -> list:
     try:
+        rates = get_exchange_rates_usd()
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
         query = supabase.table("addresses").select("*").gte("created_at", cutoff)
         if user_id:
@@ -338,7 +370,7 @@ async def check_deposits(user_id: int = None, bot=None) -> list:
                     if crypto_amount <= 0:
                         continue
                     dv_currency = CURRENCY_MAP.get(addr["currency"], addr["currency"])
-                    rate = EXCHANGE_RATES.get(dv_currency, 1.0)
+                    rate = rates.get(dv_currency, FALLBACK_EXCHANGE_RATES.get(dv_currency, 1.0))
                     usd_amount = crypto_amount * rate
 
                     deposit = {
@@ -386,6 +418,29 @@ async def deposit_worker(context: ContextTypes.DEFAULT_TYPE):
             logger.info("Auto-deposits: %s total $%.2f", len(deposits), total)
     except Exception as e:
         logger.error("Worker error: %s", e)
+
+
+async def background_scan_loop(app: Application):
+    interval = max(60, SCAN_MINUTES * 60)
+    await asyncio.sleep(30)
+    while True:
+        try:
+            deposits = await check_deposits(user_id=None, bot=app.bot)
+            if deposits:
+                total = sum(d["amount_usd"] for d in deposits)
+                logger.info("Auto-deposits(loop): %s total $%.2f", len(deposits), total)
+        except Exception as exc:
+            logger.error("Background loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def post_init(app: Application):
+    if app.job_queue:
+        app.job_queue.run_repeating(deposit_worker, interval=max(60, SCAN_MINUTES * 60), first=30)
+        logger.info("Background scanner started via JobQueue")
+    else:
+        app.create_task(background_scan_loop(app))
+        logger.warning("JobQueue missing; using asyncio fallback loop for background scanner")
 
 
 def is_admin(uid: int) -> bool:
@@ -505,11 +560,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(check_my_deposit_callback, pattern="^check_deposit_now$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.job_queue.run_repeating(deposit_worker, interval=max(60, SCAN_MINUTES * 60), first=30)
     logger.info("ULTIMATESHOP FINAL - Starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
