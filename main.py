@@ -29,7 +29,6 @@ BOT_TOKEN = config["telegram"]["token"]
 ADMIN_ID = int(config.get("telegram", {}).get("admin_id", 2124577519))
 DV_BASE_URL = config["server"]["dv_base_url"].rstrip("/")
 DV_API_KEY = config["server"]["dv_api_key"]
-TATUM_API_KEY = config.get("server", {}).get("tatum_api_key", "")
 SCAN_MINUTES = int(config.get("scanner", {}).get("interval_minutes", 5))
 ADDRESS_SCAN_HOURS = int(config.get("scanner", {}).get("address_lookback_hours", 36))
 MIN_CONFIRMATIONS = int(config.get("scanner", {}).get("min_confirmations", 2))
@@ -237,154 +236,7 @@ def get_or_create_address(user_id: int, currency: str) -> dict | None:
         return None
 
 
-def _tatum_get(path: str, params: dict | None = None):
-    if not TATUM_API_KEY:
-        logger.warning("Tatum API key missing. Set server.tatum_api_key in config.yaml")
-        return None
-    try:
-        resp = requests.get(
-            f"https://api.tatum.io{path}",
-            params=params or {},
-            headers={"x-api-key": TATUM_API_KEY},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            logger.warning("Tatum request failed %s %s status=%s", path, params or {}, resp.status_code)
-            return None
-        return resp.json()
-    except Exception as exc:
-        logger.warning("Tatum request error %s: %s", path, exc)
-        return None
-
-
-def _extract_tatum_incoming(rows: list, address: str, decimals: int, force_min_conf: int = 0) -> list[dict]:
-    out = []
-    target = str(address).lower()
-    for row in rows or []:
-        to_addr = str(row.get("to") or row.get("toAddress") or row.get("counterAddress") or "").lower()
-        if to_addr and to_addr != target:
-            continue
-
-        tx_hash = row.get("hash") or row.get("txId") or row.get("transactionHash")
-        amount_raw = row.get("amount") or row.get("value") or row.get("total") or 0
-        try:
-            amount = float(amount_raw)
-        except Exception:
-            try:
-                amount = int(str(amount_raw)) / (10 ** decimals)
-            except Exception:
-                amount = 0.0
-
-        confirmations = row.get("confirmations")
-        if confirmations is None:
-            confirmations = force_min_conf if row.get("blockNumber") or row.get("block") else 0
-        try:
-            confirmations = int(confirmations or 0)
-        except Exception:
-            confirmations = 0
-
-        if tx_hash and amount > 0:
-            out.append({"hash": tx_hash, "amount": amount, "confirmations": confirmations})
-    return out
-
-
-def _fetch_btc_txs(address: str) -> list[dict]:
-    data = _tatum_get(f"/v3/bitcoin/transaction/address/{address}", params={"pageSize": 50, "offset": 0})
-    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
-    return _extract_tatum_incoming(rows, address, decimals=8)
-
-
-def _fetch_ltc_txs(address: str) -> list[dict]:
-    data = _tatum_get(f"/v3/litecoin/transaction/address/{address}", params={"pageSize": 50, "offset": 0})
-    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
-    return _extract_tatum_incoming(rows, address, decimals=8)
-
-
-def _fetch_bnb_txs(address: str) -> list[dict]:
-    data = _tatum_get(f"/v3/bsc/transaction/address/{address}", params={"pageSize": 100, "offset": 0})
-    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
-    return _extract_tatum_incoming(rows, address, decimals=18)
-
-
-def _fetch_trc20_txs(address: str) -> list[dict]:
-    # TRC20 token transfers for an address; we only keep USDT transfers to this address.
-    data = _tatum_get(f"/v3/tron/transaction/account/{address}", params={"pageSize": 100, "offset": 0})
-    rows = data if isinstance(data, list) else data.get("transactions", []) if isinstance(data, dict) else []
-    txs = []
-    for row in rows or []:
-        to_addr = str(row.get("to") or row.get("toAddress") or "").lower()
-        symbol = str(row.get("tokenSymbol") or row.get("symbol") or row.get("asset") or "").upper()
-        if to_addr != address.lower():
-            continue
-        if symbol and symbol != "USDT":
-            continue
-        tx_hash = row.get("hash") or row.get("txId") or row.get("transactionHash")
-        amount_raw = row.get("amount") or row.get("value") or 0
-        try:
-            amount = float(amount_raw)
-        except Exception:
-            try:
-                amount = int(str(amount_raw)) / (10 ** int(row.get("tokenDecimal", 6) or 6))
-            except Exception:
-                amount = 0.0
-
-        confirmations = row.get("confirmations")
-        if confirmations is None:
-            confirmations = MIN_CONFIRMATIONS if row.get("blockNumber") else 0
-        try:
-            confirmations = int(confirmations or 0)
-        except Exception:
-            confirmations = 0
-
-        if tx_hash and amount > 0:
-            txs.append({"hash": tx_hash, "amount": amount, "confirmations": confirmations})
-    return txs
-
-
-def get_tatum_wallet_balance(address: str, currency: str) -> float:
-    endpoints = {
-        "BTC": (f"/v3/bitcoin/address/balance/{address}", 8),
-        "LTC": (f"/v3/litecoin/address/balance/{address}", 8),
-        "BNB (BEP20)": (f"/v3/bsc/account/balance/{address}", 18),
-        "USDT (TRC20)": (f"/v3/tron/account/{address}", 6),
-    }
-    endpoint = endpoints.get(currency)
-    if not endpoint:
-        return 0.0
-    path, decimals = endpoint
-    payload = _tatum_get(path)
-    if not isinstance(payload, dict):
-        return 0.0
-
-    if currency == "USDT (TRC20)":
-        for token in payload.get("trc20", []) or []:
-            symbol = str(token.get("symbol") or token.get("tokenSymbol") or "").upper()
-            if symbol == "USDT":
-                try:
-                    return float(token.get("balance", 0)) / (10 ** int(token.get("decimals", 6) or 6))
-                except Exception:
-                    return 0.0
-        return 0.0
-
-    value = payload.get("balance") or payload.get("incoming") or payload.get("value") or 0
-    try:
-        return float(value)
-    except Exception:
-        try:
-            return int(str(value)) / (10 ** decimals)
-        except Exception:
-            return 0.0
-
-
 def fetch_chain_transactions(address: str, currency: str) -> list[dict]:
-    if currency == "BTC":
-        return _fetch_btc_txs(address)
-    if currency == "LTC":
-        return _fetch_ltc_txs(address)
-    if currency == "USDT (TRC20)":
-        return _fetch_trc20_txs(address)
-    if currency == "BNB (BEP20)":
-        return _fetch_bnb_txs(address)
     return []
 
 
@@ -423,69 +275,18 @@ def get_recent_addresses_with_links(user_id: int, limit: int = 4) -> list[dict]:
         link = _address_explorer_url(address, currency)
         if not link:
             continue
-        chain_balance = get_tatum_wallet_balance(address, currency)
-        entries.append({"currency": currency, "address": address, "link": link, "chain_balance": chain_balance})
+        entries.append({"currency": currency, "address": address, "link": link})
     return entries
 
 
 async def get_incoming_transactions(user_id: int) -> list:
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
-    addresses = supabase.table("addresses").select("*").eq("user_id", user_id).gte("created_at", cutoff).execute()
-    incoming = []
-    for addr in addresses.data or []:
-        try:
-            txs = fetch_chain_transactions(addr["address"], addr["currency"])
-            for tx in txs:
-                tx_hash = tx.get("hash")
-                confirmations = int(tx.get("confirmations", 0) or 0)
-                amount = float(tx.get("amount", 0) or 0)
-                if not tx_hash or amount <= 0 or confirmations >= MIN_CONFIRMATIONS:
-                    continue
-                existing = supabase.table("deposits").select("id").eq("tx_hash", tx_hash).execute()
-                if existing.data:
-                    continue
-                incoming.append({
-                    "currency": addr["currency"],
-                    "amount": amount,
-                    "confirmations": confirmations,
-                    "tx_hash": tx_hash[:16],
-                })
-        except Exception as exc:
-            logger.error("Incoming TX check failed for %s: %s", addr.get("address"), exc)
-    return incoming
+    # Webhook mode: on-chain scanning is disabled in bot process.
+    return []
 
 
 async def get_seen_transactions(user_id: int, limit: int = 8) -> list[dict]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
-    addresses = supabase.table("addresses").select("*").eq("user_id", user_id).gte("created_at", cutoff).execute()
-
-    seen = {}
-    for addr in addresses.data or []:
-        try:
-            txs = fetch_chain_transactions(addr["address"], addr["currency"])
-            for tx in txs:
-                tx_hash = tx.get("hash")
-                amount = float(tx.get("amount", 0) or 0)
-                confirmations = int(tx.get("confirmations", 0) or 0)
-                if not tx_hash or amount <= 0:
-                    continue
-                if tx_hash in seen:
-                    continue
-
-                existing = supabase.table("deposits").select("id,usd_amount").eq("tx_hash", tx_hash).limit(1).execute()
-                applied = bool(existing.data)
-                seen[tx_hash] = {
-                    "currency": addr["currency"],
-                    "amount": amount,
-                    "confirmations": confirmations,
-                    "tx_hash": tx_hash,
-                    "applied": applied,
-                }
-        except Exception as exc:
-            logger.error("Seen TX check failed for %s: %s", addr.get("address"), exc)
-
-    ordered = sorted(seen.values(), key=lambda row: row.get("confirmations", 0), reverse=True)
-    return ordered[:limit]
+    # Webhook mode: scanner-seen tx listing is not available from bot process.
+    return []
 
 
 def get_deposit_history(user_id: int, limit: int = 8) -> list[dict]:
@@ -540,10 +341,7 @@ def _build_check_response(
         parts.append("🧾 Seen transactions:\n" + "\n".join(lines) + more)
 
     if scan_links:
-        link_lines = [
-            f"• {entry['currency']}: {entry['link']} | chain balance: {float(entry.get('chain_balance', 0)):.8f}"
-            for entry in scan_links
-        ]
+        link_lines = [f"• {entry['currency']}: {entry['link']}" for entry in scan_links]
         parts.append("🔎 Scanner links (recent addresses):\n" + "\n".join(link_lines))
 
     if history:
@@ -580,69 +378,9 @@ async def _notify_admin_deposit(bot, deposit_event: dict):
 
 
 async def check_deposits(user_id: int = None, bot=None) -> list:
-    try:
-        rates = get_exchange_rates_usd()
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=ADDRESS_SCAN_HOURS)).isoformat()
-        query = supabase.table("addresses").select("*").gte("created_at", cutoff)
-        if user_id:
-            query = query.eq("user_id", user_id)
-        addresses = query.execute()
-        new_deposits = []
-
-        for addr in addresses.data or []:
-            try:
-                txs = fetch_chain_transactions(addr["address"], addr["currency"])
-                for tx in txs:
-                    tx_hash = tx.get("hash")
-                    if not tx_hash:
-                        continue
-                    existing = supabase.table("deposits").select("id").eq("tx_hash", tx_hash).execute()
-                    if existing.data:
-                        continue
-
-                    crypto_amount = float(tx.get("amount", 0.0))
-                    confirmations = int(tx.get("confirmations", 0) or 0)
-                    if crypto_amount <= 0 or confirmations < MIN_CONFIRMATIONS:
-                        continue
-                    dv_currency = CURRENCY_MAP.get(addr["currency"], addr["currency"])
-                    rate = rates.get(dv_currency, FALLBACK_EXCHANGE_RATES.get(dv_currency, 1.0))
-                    usd_amount = crypto_amount * rate
-
-                    deposit = {
-                        "user_id": addr["user_id"],
-                        "address_id": addr["id"],
-                        "currency": addr["currency"],
-                        "crypto_amount": crypto_amount,
-                        "usd_amount": usd_amount,
-                        "rate": rate,
-                        "tx_hash": tx_hash,
-                        "tx_id": tx_hash,
-                        "confirmed": True,
-                    }
-                    supabase.table("deposits").insert(deposit).execute()
-                    update_balance(addr["user_id"], usd_amount, "add")
-                    event = {
-                        "user_id": addr["user_id"],
-                        "amount_usd": usd_amount,
-                        "crypto": f"{crypto_amount:.4f} {addr['currency']}",
-                        "tx_hash": tx_hash[:16],
-                    }
-                    new_deposits.append(event)
-                    if bot:
-                        try:
-                            await bot.send_message(
-                                chat_id=addr["user_id"],
-                                text=f"💰 Deposit received!\n{crypto_amount:.4f} {addr['currency']} = ${usd_amount:.2f}\nNew balance: ${get_balance(addr['user_id']):.2f}",
-                            )
-                        except Exception:
-                            pass
-                        await _notify_admin_deposit(bot, event)
-            except Exception as e:
-                logger.error("TX check failed for %s: %s", addr.get("address"), e)
-        return new_deposits
-    except Exception as e:
-        logger.error("Deposit check failed: %s", e)
-        return []
+    # Webhook mode: credits are applied by webhook_receiver.py when DV notifies us.
+    # The bot checks DB only and does not call chain scanners.
+    return []
 
 
 async def deposit_worker(context: ContextTypes.DEFAULT_TYPE):
@@ -671,11 +409,9 @@ async def background_scan_loop(app: Application):
 
 async def post_init(app: Application):
     if app.job_queue:
-        app.job_queue.run_repeating(deposit_worker, interval=max(60, SCAN_MINUTES * 60), first=30)
-        logger.info("Background scanner started via JobQueue")
+        logger.info("Webhook mode enabled: JobQueue scanner disabled")
     else:
-        app.create_task(background_scan_loop(app))
-        logger.warning("JobQueue missing; using asyncio fallback loop for background scanner")
+        logger.info("Webhook mode enabled: asyncio scanner fallback disabled")
 
 
 def is_admin(uid: int) -> bool:
